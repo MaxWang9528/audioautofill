@@ -205,8 +205,10 @@ def main():
     ok &= good_error
 
     rc, log = run_tool([str(OUT / "clips_short_head"), "-t", str(m3u), "-o", str(OUT / "short.wav")], "log_short.txt")
-    good_error = rc != 0 and "too short" in log
-    print(f"too-short head rejected with a clear message: {good_error}")
+    # it's the only clip, so its head is only needed for the intro: expect a clear warning and a
+    # set that starts with the clip itself (no intro)
+    good_error = rc == 0 and "no intro" in log and "couldn't find a clean head" in log
+    print(f"unusable head on the first clip -> warned, no intro: {good_error}")
     if not good_error:
         print(log[-600:])
     ok &= good_error

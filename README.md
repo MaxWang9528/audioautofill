@@ -43,7 +43,15 @@ rekordbox writes a `.cue` next to each recording, which tells the tool which tra
 .venv\Scripts\python -m audioautofill clips E:\TESTS\my_set -s E:\Contents -o my_set_full.wav
 ```
 
-The clips are used in file-name order. The tool identifies the track, position and tempo at the
+Clips in one folder are used in file-name order. If you point it at a folder of rekordbox
+recording folders (`Unknown Album`, `Unknown Album(6)`, ... - every clip has the same file name),
+they're ordered by recording time; the order is printed so you can check it. You can also list the
+clip files or folders explicitly, in order.
+
+Beat jumping right after pressing record, or just before stopping, is fine: the tool uses the
+clean stretch that runs into / out of each transition and ignores fragments before or after a jump
+(the skipped music becomes part of the fill). If the last clip's end (or the first clip's start)
+can't be used, the set simply ends (starts) with that clip's own audio, with a warning. The tool identifies the track, position and tempo at the
 head and tail of every clip, and renders the music between consecutive clips from the original
 files - time-stretched to your tempo and tone/level-matched to your recording (EQ and master
 colouring included). Before the first clip the first track plays from its start (`--no-intro` to

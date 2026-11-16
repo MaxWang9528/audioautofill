@@ -58,8 +58,9 @@ def main(argv: list[str]) -> int:
         log("Clip file(s) not found: " + ", ".join(str(f) for f in missing_files) if missing_files else "No clips found.")
         return 2
     log(f"Clips ({len(files)}, in this order):")
+    common = files[0].parent if len({f.parent for f in files}) == 1 else None
     for f in files:
-        log(f"  {f.name}")
+        log(f"  {f.name if common else f}")
 
     # Track lists: each clip's own .cue, plus anything given with -t.
     per_clip_sources = []
@@ -102,10 +103,16 @@ def main(argv: list[str]) -> int:
                 own_idx = [index_of[p] for p in own if p in index_of]
                 if len(own_idx) >= 2:
                     cands = own_idx
-            c = analyze_clip(f, tracks, cands, ratios)
+            # only the first clip's head (intro) and the last clip's tail (outro) are optional
+            c = analyze_clip(f, tracks, cands, ratios, need_head=bool(clips), need_tail=f is not files[-1])
             clips.append(c)
+            for which, msg in c.skipped.items():
+                what = "intro (the first track from its start)" if which == "head" else "outro (the last track to its end)"
+                log(f"  ! {msg}\n    -> no {what}; the set {'starts' if which == 'head' else 'ends'} with this clip's own audio")
             for which, e in (("head", c.head), ("tail", c.tail)):
-                log(f"  {f.name} {which}: {tracks[e.track].name} at {fmt_t(e.pos(e.splice))} (x{e.r:.4f}), "
+                if e is None:
+                    continue
+                log(f"  {f.parent.name}/{f.name} {which}: {tracks[e.track].name} at {fmt_t(e.pos(e.splice))} (x{e.r:.4f}), "
                     f"splice {e.splice:.2f}s into clip, match {e.score:.2f}")
                 for n in e.notes:
                     log(f"      ! {n}")
@@ -119,8 +126,8 @@ def main(argv: list[str]) -> int:
         return 1
 
     report = {
-        "clips": [{"file": str(c.path),
-                   **{w: {"track": tracks[e.track].name, "position": round(e.pos(e.splice), 3), "tempo_ratio": round(e.r, 5),
+        "clips": [{"file": str(c.path), "skipped_edges": c.skipped,
+                   **{w: None if e is None else {"track": tracks[e.track].name, "position": round(e.pos(e.splice), 3), "tempo_ratio": round(e.r, 5),
                           "splice": round(e.splice, 3), "window": [round(x, 2) for x in e.window], "match": round(e.score, 3),
                           "notes": e.notes} for w, e in (("head", c.head), ("tail", c.tail))}} for c in clips],
     }
@@ -133,7 +140,8 @@ def main(argv: list[str]) -> int:
     log("")
     log.stage("Rendering the set...")
     try:
-        stats = assemble(clips, tracks, out_path, intro=not args.no_intro, outro=not args.no_outro,
+        stats = assemble(clips, tracks, out_path, intro=not args.no_intro and clips[0].head is not None,
+                         outro=not args.no_outro and clips[-1].tail is not None,
                          xfade_s=args.crossfade_ms / 1000, engine=args.engine, log=log)
     except ClipError as e:
         log(f"\nCan't build the set: {e}")

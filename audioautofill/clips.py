@@ -41,16 +41,31 @@ class ClipError(Exception):
     pass
 
 
+def display(p: Path) -> str:
+    """Clip name for messages: rekordbox gives every recording the same file name in its own folder."""
+    return f"{p.parent.name}/{p.name}"
+
+
 def natural_key(p: Path):
     return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", p.name)]
 
 
+CLIP_EXTS = (".wav", ".aif", ".aiff", ".flac")
+
+
 def find_clip_files(sources: list[Path], exclude: set[Path]) -> list[Path]:
+    """Clips in set order. A folder of clips is sorted by name; a folder whose clips sit in
+    subfolders (rekordbox puts every recording in its own folder, all with similar names) is
+    sorted by recording time instead."""
     files: list[Path] = []
     for s in sources:
         if s.is_dir():
-            files += sorted((p for p in s.iterdir() if p.is_file() and p.suffix.lower() in (".wav", ".aif", ".aiff", ".flac")),
-                            key=natural_key)
+            flat = [p for p in s.iterdir() if p.is_file() and p.suffix.lower() in CLIP_EXTS]
+            nested = [p for p in s.rglob("*") if p.is_file() and p.suffix.lower() in CLIP_EXTS and p.parent != s]
+            if nested:
+                files += sorted(flat + nested, key=lambda p: p.stat().st_mtime)
+            else:
+                files += sorted(flat, key=natural_key)
         else:
             files.append(s)
     return [f for f in files if f.resolve() not in exclude]
@@ -84,6 +99,7 @@ class Clip:
     fmt: str
     head: End | None = None
     tail: End | None = None
+    skipped: dict = field(default_factory=dict)  # edges that couldn't be used (first head / last tail only)
 
     @property
     def duration(self) -> float:
@@ -107,96 +123,169 @@ def _pick_splice(flux: np.ndarray, lo: float, hi: float) -> float:
     return max(lo, j / FINE_FPS - 0.02)
 
 
+def _edge_track_and_chain(which: str, clip: Clip, cm, chains: dict[int, list[Chain]], limit: float | None):
+    """The track playing at this edge, and its chain that runs into (head) / out of (tail) the
+    transition. Fragments before a beat jump right after pressing record, or after a jump just
+    before stopping, are other chains of the same track and are skipped."""
+    dur = clip.duration
+    L = cm.win_seconds
+    edge = 15.0
+    best = None
+    for li, cs in chains.items():
+        if not any((c.start <= 4.0) if which == "head" else (c.end + L >= dur - 4.0) for c in cs):
+            continue  # this track isn't playing at the very edge
+        sel = [s for c in cs for t, s in zip(c.t, c.s) if (t <= edge if which == "head" else t + L >= dur - edge)]
+        if len(sel) >= 2 and (best is None or np.mean(sel) * min(1.0, len(sel) / 6) > best[0]):
+            best = (float(np.mean(sel)) * min(1.0, len(sel) / 6), li)
+    if best is None:
+        raise ClipError(f"{display(clip.path)}: couldn't identify the track playing at the {which} "
+                        f"(is it in the track list, and is it playing alone there?)")
+    li = best[1]
+    cs = chains[li]
+    # Of that track's chains on this side of the transition, take the one with the most match
+    # evidence: a fragment before/after a beat jump at the very edge is short, and so is a stray
+    # match to another copy of a repeating section.
+    if which == "head":
+        bound = limit if limit is not None else dur * 0.6
+        pool = [c for c in cs if c.start < bound]
+        key = lambda c: (sum(c.s), c.end)  # noqa: E731
+    else:
+        bound = limit if limit is not None else dur * 0.4
+        pool = [c for c in cs if c.end + L > bound]
+        key = lambda c: (sum(c.s), -c.start)  # noqa: E731
+    chain = max(pool or cs, key=key)
+    return li, chain
+
+
+def _clean_run(which: str, tr: Track, fine: np.ndarray, a: float, r: float, lo: float, hi: float,
+               win: float = 2.0, step: float = 0.25, drop: float = 0.08, level_tol: float = 0.5,
+               min_len: float = CHUNK + 1.5):
+    """Along the playback line p = a + r t, the stretch of [lo, hi] where the recording is clearly
+    this track alone. Returns (start, end) or None. Head: the earliest such stretch (most settled,
+    furthest from the transition); tail: the latest."""
+    if hi - lo < win:
+        return None
+    starts = np.arange(lo, hi - win + 1e-9, step)
+    sc = np.array([fine_offset(tr.fine, fine, t, t + win, r, a, search=0.03)[1] for t in starts])
+    # On real rekordbox recordings a single track alone matches at ~0.96-0.98 with its level steady
+    # to +-0.1 dB; a second track, fader/EQ move or beat jump drops the match and/or shifts the level.
+    # Reference: the outer edge (clean by how the clips are recorded) - unless that is a fragment
+    # before a beat jump, in which case the bulk of the stretch sets it.
+    outer4 = sc[:4] if which == "head" else sc[-4:]
+    ref = max(float(np.percentile(sc, 90)), float(np.median(outer4)))
+    good = sc >= ref - drop
+    # Level: alone, the recording is the original times a constant gain. Another track coming in
+    # (or a fader/EQ move) changes the level relative to the original even when the match stays
+    # decent, so each window's level must stay close to the outer edge's.
+    j0 = int(lo * FINE_FPS)
+    n = int((hi - lo) * FINE_FPS)
+    Y = resample_time(tr.fine, (a + r * j0 / FINE_FPS) * FINE_FPS, r, n)
+    X = fine[:, j0 : j0 + n]
+    n = min(n, X.shape[1])
+    pw = lambda M: 10 * np.log10(np.sum(10 ** (M[:, :n].astype(np.float64) / 10), axis=0) + 1e-12)  # noqa: E731
+    d = pw(X) - pw(Y)
+    k = int(win * FINE_FPS)
+    lvl = np.array([np.median(d[int((t - lo) * FINE_FPS) : int((t - lo) * FINE_FPS) + k]) for t in starts])
+    outer = np.nonzero(good)[0]
+    if outer.size:
+        edge_idx = outer[:4] if which == "head" else outer[-4:]
+        ref_lvl = float(np.median(lvl[edge_idx]))
+        good &= np.abs(lvl - ref_lvl) <= level_tol
+    # close short gaps (up to 1 s) - real music dips briefly (vocals, sparse bars)
+    gap = int(1.0 / step)
+    i = 0
+    while i < len(good):
+        if not good[i]:
+            j = i
+            while j < len(good) and not good[j]:
+                j += 1
+            if 0 < i and j < len(good) and j - i <= gap:
+                good[i:j] = True
+            i = j
+        else:
+            i += 1
+    runs, i = [], 0
+    while i < len(good):
+        if good[i]:
+            j = i
+            while j + 1 < len(good) and good[j + 1]:
+                j += 1
+            runs.append((float(starts[i]), float(starts[j] + win)))
+            i = j + 1
+        else:
+            i += 1
+    runs = [rn for rn in runs if rn[1] - rn[0] >= min_len]
+    if not runs:
+        return None
+    return min(runs, key=lambda rn: rn[0]) if which == "head" else max(runs, key=lambda rn: rn[1])
+
+
 def _analyze_end(which: str, clip: Clip, fine: np.ndarray, cm, local: list[Track], chains: dict[int, list[Chain]],
                  flux: np.ndarray, limit: float | None = None) -> tuple[End, Chain]:
     """limit: for the head, when the incoming track becomes audible; for the tail, when the
-    outgoing track stops being audible (clip seconds). The edge window stays clear of it."""
+    outgoing track stops being audible (clip seconds). The edge stays clear of it."""
     dur = clip.duration
     L = cm.win_seconds
-    # 1) which chain sits at this edge
-    best = None
-    for li, cs in chains.items():
-        for c in cs:
-            if which == "head":
-                if c.start > 3.0:
-                    continue
-                sel = [s for t, s in zip(c.t, c.s) if t <= HEAD_WINDOW]
-            else:
-                if c.end + L < dur - 3.0:
-                    continue
-                sel = [s for t, s in zip(c.t, c.s) if t + L >= dur - HEAD_WINDOW]
-            if sel and (best is None or np.mean(sel) > best[0]):
-                best = (float(np.mean(sel)), li, c)
-    if best is None:
-        raise ClipError(f"{clip.path.name}: couldn't identify the track playing at the {which} "
-                        f"(is it in the track list, and is it playing alone there?)")
-    _, li, chain = best
+    li, chain = _edge_track_and_chain(which, clip, cm, chains, limit)
     tr = local[li]
     notes: list[str] = []
     debug: list[str] = []
 
-    # 2) verified window at the edge, clear of the other track. Besides the other track's own
-    #    playback (limit), stop where this track's frame-by-frame match starts dropping - a quiet
-    #    incoming track or a fader/EQ move shows up there.
-    drop = _match_drop(which, tr, fine, chain, dur, L)
-    if drop is not None:
-        limit = drop if limit is None else (min(limit, drop) if which == "head" else max(limit, drop))
-    if which == "head":
-        hi = min(HEAD_WINDOW, dur / 2 - 0.5, limit if limit is not None else np.inf)
-        win = (EDGE_GUARD, hi)
-        side = (EDGE_GUARD, min(chain.end + L / 2, 16.0, hi if limit is not None else np.inf))
-        line = chain.predict_before
+    # 1) the playback line of that chain
+    r0 = chain._fit(at_end=(which == "tail"), span=1e9)[0]
+    line = chain.predict_before if which == "head" else chain.predict_after
+    # the whole playback along this line in the clip (it can be split into several chains)
+    c_lo = max(EDGE_GUARD, _same_playback_extent(chains[li], chain, earliest=True))
+    c_hi = min(dur - EDGE_GUARD, _same_playback_extent(chains[li], chain, earliest=False) + L)
+    if which == "head" and limit is not None:
+        c_hi = min(c_hi, limit)
+    if which == "tail" and limit is not None:
+        c_lo = max(c_lo, limit)
+    if which == "head":  # the start of a chain can be a mixed window: look a bit before it too
+        c_lo = max(EDGE_GUARD, c_lo - L / 2)
     else:
-        lo = max(dur - HEAD_WINDOW, dur / 2 + 0.5, limit if limit is not None else -np.inf)
-        win = (lo, dur - EDGE_GUARD)
-        side = (max(chain.start + L / 2, dur - 16.0, lo if limit is not None else -np.inf), dur - EDGE_GUARD)
-        line = chain.predict_after
-    if win[1] - win[0] < CHUNK + 1.5:
-        when = (f"the next track comes in about {limit:.1f} s into the clip" if which == "head" and limit is not None
-                else f"the previous track is still audible until about {limit:.1f} s" if limit is not None else "")
-        raise ClipError(f"{clip.path.name}: the clean {which} is too short ({max(0.0, win[1] - win[0]):.1f} s"
-                        + (f"; {when}" if when else "") + "). Leave at least 8 s with only one track playing at each end.")
+        c_hi = min(dur - EDGE_GUARD, c_hi + L / 2)
+    tc = (c_lo + c_hi) / 2
+    r, _ = estimate_ratio(tr, fine, [(c_lo, c_hi, line)], r0, span=0.012)
+    a, _ = fine_offset(tr.fine, fine, c_lo, c_hi, r, line(tc) - r * tc, search=0.6)
 
-    # 3) tempo near this edge, then the exact offset over the window
-    r0 = chain.slope_start() if which == "head" else chain.slope_end()
-    tc = (win[0] + win[1]) / 2
-    r, _ = estimate_ratio(tr, fine, [(win[0], win[1], line)], r0, span=0.012)
-    a, score = fine_offset(tr.fine, fine, win[0], win[1], r, line(tc) - r * tc, search=0.6)
+    # 2) the clean stretch along that line
+    run = _clean_run(which, tr, fine, a, r, c_lo, c_hi)
+    if run is None:
+        when = (f" - the next track comes in about {limit:.1f} s into the clip" if which == "head" and limit is not None
+                else f" - the previous track is audible until about {limit:.1f} s" if limit is not None else "")
+        raise ClipError(f"{display(clip.path)}: couldn't find a clean {which} of at least {CHUNK + 1.5:.1f} s with only "
+                        f"'{tr.name}' playing{when}. Leave at least 8 s with only one track playing, unchanged, at each end.")
+    lo, hi = run
+    if which == "head" and lo > 2.0:
+        notes.append(f"ignoring the first {lo:.1f} s of the clip (they don't run into the transition - a beat jump?)")
+    if which == "tail" and dur - hi > 2.0:
+        notes.append(f"ignoring the last {dur - hi:.1f} s of the clip (they don't follow on from the transition - a beat jump?)")
+
+    # 3) exact tempo and offset over the clean stretch
     precise = lambda t, a=a, r=r: a + r * t  # noqa: E731
-    r_new, used = measure_ratio(tr, fine, [(side[0], side[1], precise)], r, region=3.0, min_span=6.0)
+    r_new, used = measure_ratio(tr, fine, [(lo, hi, precise)], r, region=3.0, min_span=6.0)
     if not used:
-        r_new, _ = estimate_ratio(tr, fine, [(side[0], side[1], precise)], r, span=0.0015)
-        debug.append(f"{which}: tempo measured from a short section ({side[1] - side[0]:.1f} s)")
-    # keep the position at the window centre, re-fit the offset for the new tempo
-    a, score = fine_offset(tr.fine, fine, win[0], win[1], r_new, precise(tc) - r_new * tc, search=0.1)
+        r_new, _ = estimate_ratio(tr, fine, [(lo, hi, precise)], r, span=0.0015)
+        debug.append(f"{which}: tempo measured from a short section ({hi - lo:.1f} s)")
+    tm = (lo + hi) / 2
+    a, score = fine_offset(tr.fine, fine, lo, hi, r_new, precise(tm) - r_new * tm, search=0.1)
     r = r_new
-
     if score < 0.65:
-        small = (win[0], win[0] + 5.0) if which == "head" else (win[1] - 5.0, win[1])
-        _, sc = fine_offset(tr.fine, fine, small[0], small[1], r, a, search=0.05)
-        if sc >= 0.65:
-            win = small
-            notes.append("only the outermost 5 s look like the track alone")
-        else:
-            raise ClipError(f"{clip.path.name}: the {which} doesn't match '{tr.name}' cleanly (score {score:.2f}); "
-                            f"leave at least 8 s with only that track playing, unchanged, at the {which}")
-    # steadiness inside the window (informational)
-    j0, j1 = int(win[0] * FINE_FPS), int(win[1] * FINE_FPS)
-    if j1 - j0 > 20:
-        Y = resample_time(tr.fine, (a + r * j0 / FINE_FPS) * FINE_FPS, r, j1 - j0)
-        fs = np.convolve(framewise_similarity(fine[:, j0:j1], Y), np.ones(43) / 43, mode="valid")
-        if fs.size and fs.min() < np.median(fs) - 0.4:
-            debug.append(f"{which}: match varies within the edge window (min {fs.min():.2f}, median {np.median(fs):.2f})")
+        raise ClipError(f"{display(clip.path)}: the {which} doesn't match '{tr.name}' cleanly (score {score:.2f}); "
+                        f"leave at least 8 s with only that track playing, unchanged, at the {which}")
 
-    # 4) splice point: just before a transient, early in the head / late in the tail
+    # 4) splice: just before a transient, at the outer end of the clean stretch (keeps the most
+    #    real recording), with CHUNK seconds of clean audio on the inner side for alignment
     if which == "head":
-        lo, hi = 0.75, min(win[1] - CHUNK - 0.2, 3.5)
+        s_lo, s_hi = lo + 0.25, min(lo + 3.0, hi - CHUNK - 0.2)
     else:
-        lo, hi = max(win[0] + CHUNK + 0.2, dur - 3.5), dur - 0.75
-    if hi <= lo:
-        raise ClipError(f"{clip.path.name}: the clean {which} is too short ({win[1] - win[0]:.1f} s); "
+        s_lo, s_hi = max(hi - 3.0, lo + CHUNK + 0.2), hi - 0.25
+    if s_hi <= s_lo:
+        raise ClipError(f"{display(clip.path)}: the clean {which} is too short ({hi - lo:.1f} s); "
                         f"leave at least 8 s with only one track playing at each end")
-    splice = _pick_splice(flux, lo, hi)
+    splice = _pick_splice(flux, s_lo, s_hi)
+    win = (lo, min(hi, splice + HEAD_WINDOW)) if which == "head" else (max(lo, splice - HEAD_WINDOW), hi)
 
     amb = ambiguous_copy_offset(chain, tr, fine, L, near_jump_end=(which == "tail"), margin=0.02)
     if amb >= 16.0:
@@ -204,35 +293,9 @@ def _analyze_end(which: str, clip: Clip, fine: np.ndarray, cm, local: list[Track
                      f"could be that much too long or short (it will still sound seamless)")
     elif amb > 0:
         debug.append(f"{which}: section repeats ({amb:.1f} s away matches about as well)")
+    debug.append(f"{which}: clean stretch {lo:.2f}-{hi:.2f} s")
     return End(track=tr.index, a=a, r=r, window=win, splice=splice, score=score, ambiguous=amb, notes=notes,
                debug=debug), chain
-
-
-def _match_drop(which: str, tr: Track, fine: np.ndarray, chain: Chain, dur: float, L: float,
-                span: float = 16.0, drop: float = 0.1) -> float | None:
-    """Clip time where the edge track's match falls clearly (and lastingly) below its level at the
-    very edge - a second track coming in, or a fader/EQ move. Sliding 1 s windows, 0.25 s apart."""
-    if which == "head":
-        t0, t1 = EDGE_GUARD, min(dur - EDGE_GUARD, span)
-    else:
-        t0, t1 = max(EDGE_GUARD, dur - span), dur - EDGE_GUARD
-    if t1 - t0 < 3.0:
-        return None
-    r = chain.slope_start() if which == "head" else chain.slope_end()
-    line = chain.predict_before if which == "head" else chain.predict_after
-    ref_lo, ref_hi = (t0, t0 + 2.0) if which == "head" else (t1 - 2.0, t1)
-    tcr = (ref_lo + ref_hi) / 2
-    a, _ = fine_offset(tr.fine, fine, ref_lo, ref_hi, r, line(tcr) - r * tcr, search=0.6)
-    starts = np.arange(t0, t1 - 1.0 + 1e-9, 0.25)
-    if which == "tail":
-        starts = starts[::-1]
-    sc = np.array([fine_offset(tr.fine, fine, s0, s0 + 1.0, r, a, search=0.03)[1] for s0 in starts])
-    ref = float(np.median(sc[:4]))
-    below = sc < ref - drop
-    for i in range(len(sc) - 5):
-        if below[i : i + 6].all():  # sustained for 1.5 s
-            return float(starts[i]) if which == "head" else float(starts[i] + 1.0)
-    return None
 
 
 def _same_playback_extent(cs: list[Chain], ref: Chain, earliest: bool) -> float:
@@ -249,7 +312,8 @@ def _same_playback_extent(cs: list[Chain], ref: Chain, earliest: bool) -> float:
     return best
 
 
-def analyze_clip(path: Path, tracks: list[Track], candidates: list[int], ratios: np.ndarray) -> Clip:
+def analyze_clip(path: Path, tracks: list[Track], candidates: list[int], ratios: np.ndarray,
+                 need_head: bool = True, need_tail: bool = True) -> Clip:
     info = sf.info(str(path))
     clip = Clip(path, info.samplerate, info.channels, info.frames, info.subtype, info.format)
     fine = logmel(load_mono_resampled_stream(path, ANALYSIS_SR))
@@ -263,16 +327,39 @@ def analyze_clip(path: Path, tracks: list[Track], candidates: list[int], ratios:
             reanchor(c, t, fine, L)
         chains[li] = cs
     flux = _onset_strength(fine)
-    head, head_chain = _analyze_end("head", clip, fine, cm, local, chains, flux)
-    tail, tail_chain = _analyze_end("tail", clip, fine, cm, local, chains, flux)
-    hl, tl = candidates.index(head.track), candidates.index(tail.track)
-    if hl != tl:
+
+    def edge(which, need):
+        try:
+            return _edge_track_and_chain(which, clip, cm, chains, None)
+        except ClipError as e:
+            if need:
+                raise
+            clip.skipped[which] = str(e)
+            return None, None
+
+    hl, head_chain = edge("head", need_head)
+    tl, tail_chain = edge("tail", need_tail)
+    lim_head = lim_tail = None
+    if hl is not None and tl is not None and hl != tl:
         # keep each edge clear of the other track: the incoming one is audible from (about) the start
         # of its playback in this clip, the outgoing one until (about) the end of its playback
-        incoming_from = _same_playback_extent(chains[tl], tail_chain, earliest=True)
-        outgoing_until = _same_playback_extent(chains[hl], head_chain, earliest=False) + L / 2
-        head, _ = _analyze_end("head", clip, fine, cm, local, chains, flux, limit=incoming_from - 1.0)
-        tail, _ = _analyze_end("tail", clip, fine, cm, local, chains, flux, limit=outgoing_until)
+        lim_head = _same_playback_extent(chains[tl], tail_chain, earliest=True) - 1.0
+        lim_tail = _same_playback_extent(chains[hl], head_chain, earliest=False) + L / 2
+    head = tail = None
+    for which, idx, lim, need in (("head", hl, lim_head, need_head), ("tail", tl, lim_tail, need_tail)):
+        if idx is None:
+            continue
+        try:
+            end, _ = _analyze_end(which, clip, fine, cm, local, chains, flux, limit=lim)
+        except ClipError as e:
+            if need:
+                raise
+            clip.skipped[which] = str(e)
+            continue
+        if which == "head":
+            head = end
+        else:
+            tail = end
     clip.head, clip.tail = head, tail
     return clip
 
@@ -400,14 +487,14 @@ def plan_bridges(clips: list[Clip], tracks: list[Track]) -> list[str]:
     for i in range(len(clips) - 1):
         A, B = clips[i], clips[i + 1]
         if A.tail.track != B.head.track:
-            lines = [f"  {c.path.name}: starts with '{tracks[c.head.track].name}', ends with '{tracks[c.tail.track].name}'"
+            lines = [f"  {display(c.path)}: starts with '{tracks[c.head.track].name}', ends with '{tracks[c.tail.track].name}'"
                      for c in clips]
-            raise ClipError(f"{A.path.name} ends with '{tracks[A.tail.track].name}' but the next clip, {B.path.name}, "
+            raise ClipError(f"{display(A.path)} ends with '{tracks[A.tail.track].name}' but the next clip, {display(B.path)}, "
                             f"starts with '{tracks[B.head.track].name}'. Is a clip missing or out of order?\n" + "\n".join(lines))
         p_out, p_in = A.tail.pos(A.tail.splice), B.head.pos(B.head.splice)
         amb = max(A.tail.ambiguous, B.head.ambiguous)
         if amb >= 16.0:
-            notes.append(f"WARNING: the fill in '{tracks[A.tail.track].name}' between {A.path.name} and {B.path.name} "
+            notes.append(f"WARNING: the fill in '{tracks[A.tail.track].name}' between {display(A.path)} and {display(B.path)} "
                          f"starts or ends in a section that repeats; it may be about {amb:.0f} s too long or short "
                          f"(seamless either way, but listen to whether the track's structure is right)")
         if p_in - p_out >= MIN_BRIDGE:
@@ -417,16 +504,16 @@ def plan_bridges(clips: list[Clip], tracks: list[Track]) -> list[str]:
         t_new = (p_out + MIN_BRIDGE - B.head.a) / B.head.r
         if t_new + CHUNK + 0.2 <= B.head.window[1]:
             B.head.splice = t_new
-            notes.append(f"{A.path.name} and {B.path.name} overlap in '{tracks[B.head.track].name}'; joined with a short fill")
+            notes.append(f"{display(A.path)} and {display(B.path)} overlap in '{tracks[B.head.track].name}'; joined with a short fill")
             continue
         t_new = (p_in - MIN_BRIDGE - A.tail.a) / A.tail.r
         if t_new - CHUNK - 0.2 >= A.tail.window[0]:
             A.tail.splice = t_new
-            notes.append(f"{A.path.name} and {B.path.name} overlap in '{tracks[A.tail.track].name}'; joined with a short fill")
+            notes.append(f"{display(A.path)} and {display(B.path)} overlap in '{tracks[A.tail.track].name}'; joined with a short fill")
             continue
         raise ClipError(
-            f"{B.path.name} starts at {p_in:.1f} s into '{tracks[B.head.track].name}', which is before where "
-            f"{A.path.name} ends ({p_out:.1f} s). That's more overlap than the clips' clean edges allow - or one of "
+            f"{display(B.path)} starts at {p_in:.1f} s into '{tracks[B.head.track].name}', which is before where "
+            f"{display(A.path)} ends ({p_out:.1f} s). That's more overlap than the clips' clean edges allow - or one of "
             f"them was matched to the wrong copy of a repeated section"
             + (f" (repeats noted: {A.tail.ambiguous:.1f} s / {B.head.ambiguous:.1f} s)" if A.tail.ambiguous or B.head.ambiguous else "")
             + ".")
@@ -438,7 +525,7 @@ def assemble(clips: list[Clip], tracks: list[Track], out_path: Path, intro: bool
     sr, ch = clips[0].sr, clips[0].channels
     for c in clips:
         if c.sr != sr:
-            raise ClipError(f"{c.path.name} is {c.sr} Hz but {clips[0].path.name} is {sr} Hz; record all clips the same way")
+            raise ClipError(f"{display(c.path)} is {c.sr} Hz but {display(clips[0].path)} is {sr} Hz; record all clips the same way")
     h = int(xfade_s * sr / 2)
     ext_fmt = {".wav": "WAV", ".aif": "AIFF", ".aiff": "AIFF", ".flac": "FLAC"}.get(out_path.suffix.lower())
     kw = {"subtype": clips[0].subtype} if ext_fmt == clips[0].fmt else {}
@@ -517,7 +604,7 @@ def assemble(clips: list[Clip], tracks: list[Track], out_path: Path, intro: bool
                 emit_clip(c, cursor, si - h)
             else:
                 emit_clip(c, cursor, c.frames)
-            stats["labels"].append((t_clip0, written / sr, f"clip {c.path.name}"))
+            stats["labels"].append((t_clip0, written / sr, f"clip {display(c.path)}"))
             if not last:
                 nxt = clips[i + 1]
                 t = tracks[c.tail.track]
