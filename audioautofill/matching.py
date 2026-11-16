@@ -129,7 +129,10 @@ def coarse_match(
     for k, (ti, r, m) in enumerate(entries):
         Fr = resample_time(tracks[ti].coarse, 0.0, r, m)
         bank[:, :, k] = np.fft.rfft(Fr, nfft, axis=1).T
-        dens.append(sliding_denominator(Fr, L).astype(np.float32))
+        den = sliding_denominator(Fr, L)
+        # (near-)silent stretches of a track have no variance to correlate with: never a match
+        den = np.where(den > 1e-3 * max(float(np.median(den)), 1e-6), den, np.inf)
+        dens.append(den.astype(np.float32))
 
     score = np.full((nW, nT, N_CAND), -1.0, dtype=np.float32)
     ratio = np.ones((nW, nT, N_CAND), dtype=np.float32)
@@ -615,7 +618,8 @@ def ambiguous_copy_offset(chain: Chain, track: Track, rec_fine: np.ndarray, win_
     return worst
 
 
-def measure_ratio(track: Track, rec_fine: np.ndarray, sides, r0: float, region: float = 4.0) -> tuple[float, int]:
+def measure_ratio(track: Track, rec_fine: np.ndarray, sides, r0: float, region: float = 4.0,
+                  min_span: float = 8.0) -> tuple[float, int]:
     """Tempo ratio from how the measured line offset drifts over time.
 
     sides: [(t_lo, t_hi, line_fn)], each one continuous playback (the two sides of a jump share
@@ -651,7 +655,7 @@ def measure_ratio(track: Track, rec_fine: np.ndarray, sides, r0: float, region: 
             if new_keep.sum() < 3 or (new_keep == keep).all():
                 break
             keep = new_keep
-        if np.ptp(t_arr[keep]) < 8.0:  # not enough time span to measure drift
+        if np.ptp(t_arr[keep]) < min_span:  # not enough time span to measure drift
             break
         r = r + beta
         used = int(keep.sum())

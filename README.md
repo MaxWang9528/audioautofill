@@ -26,7 +26,35 @@ py -3.12 -m venv .venv
 
 Optional, for .m4a/AAC tracks: `.venv\Scripts\pip install -e .[ffmpeg]`
 
-## Usage
+## Clip mode (one recording per transition) - recommended
+
+Record each transition as its own file instead of one long recording with beat jumps:
+
+1. Get the outgoing track playing alone, settled (tempo, EQ, FX where you'll leave them), and
+   start recording.
+2. After **at least ~5 s (8+ is better)**, do the transition.
+3. Once the incoming track is playing alone and settled, keep recording **another 5-8+ s**, then stop.
+4. Load the next track, get to your next transition point (beat jump, cue, whatever) and repeat.
+
+rekordbox writes a `.cue` next to each recording, which tells the tool which tracks are in it.
+
+```
+.venv\Scripts\python -m audioautofill clips E:\TESTS\my_set -s E:\Contents -o my_set_full.wav
+```
+
+The clips are used in file-name order. The tool identifies the track, position and tempo at the
+head and tail of every clip, and renders the music between consecutive clips from the original
+files - time-stretched to your tempo and tone/level-matched to your recording (EQ and master
+colouring included). Before the first clip the first track plays from its start (`--no-intro` to
+skip); after the last clip the last track plays to its end (`--no-outro`). A clip may contain more
+than one transition, and consecutive clips may overlap.
+
+It stops with an explanation instead of guessing if clips are out of order or missing, if an
+edge isn't a single settled track, or if consecutive clips can't be joined.
+
+## Beat-jump mode (one long recording)
+
+### Usage
 
 ```
 .venv\Scripts\python -m audioautofill "E:\TESTS\01 REC-2026-11-14.wav" -s E:\Contents -o my_set_full.wav

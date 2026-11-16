@@ -112,7 +112,11 @@ def ncc(W: np.ndarray, F: np.ndarray) -> np.ndarray:
         return np.zeros(M - L + 1)
     n = _next_pow2(M)
     num = np.fft.irfft((np.conj(np.fft.rfft(W0, n, axis=1)) * np.fft.rfft(F, n, axis=1)).sum(axis=0), n)[: M - L + 1]
-    return num / (sliding_denominator(F, L) * wn)
+    den = sliding_denominator(F, L)
+    # Where F is (nearly) constant - e.g. clamped past the end of a track - there's nothing to
+    # correlate with; report no match instead of a huge ratio.
+    ok = den > 1e-3 * max(float(np.median(den)), 1e-6)
+    return np.clip(np.where(ok, num / (den * wn), 0.0), -1.0, 1.0)
 
 
 def parabolic_peak(c: np.ndarray, k: int) -> float:

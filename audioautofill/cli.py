@@ -68,6 +68,18 @@ def analyze_track(i: int, path: Path) -> Track:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not sys.stdout.isatty():  # redirected output on Windows defaults to cp1252 and can't print every name
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    if argv and argv[0] == "clips":
+        from .cli_clips import main as clips_main
+
+        return clips_main(argv[1:])
+    if argv and argv[0] == "jumps":
+        argv = argv[1:]
     ap = argparse.ArgumentParser(
         prog="audioautofill",
         description="Rebuild a full DJ set from a recording where the boring parts were skipped with beat jumps.",
