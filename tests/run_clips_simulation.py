@@ -114,10 +114,10 @@ def build():
     t5_solo = trans[4][0] - trans[3][1]
     c4_head = t5_solo - h3_tail + 4.5  # overlaps clip 3's tail by 4.5 s
     clips_spec = [
-        ("01 REC clip.wav", trans[0][0] - hl(), trans[0][1] + hl(), 0.9, False, [0, 1]),
+        ("01 REC clip.wav", trans[0][0] - 7.0, trans[0][1] + hl(), 0.9, False, [0, 1]),  # short head
         ("02 REC clip.wav", trans[1][0] - hl(), trans[2][1] + hl(), 0.7, True, [1, 2, 3]),
         ("03 REC clip.wav", trans[3][0] - hl(), trans[3][1] + h3_tail, 0.85, False, None),
-        ("04 REC clip.wav", trans[4][0] - c4_head, trans[4][1] + hl(), 0.8, False, [4, 5]),
+        ("04 REC clip.wav", trans[4][0] - c4_head, trans[4][1] + 7.0, 0.8, False, [4, 5]),  # short tail
     ]
     clip_dir = OUT / "clips"
     clip_dir.mkdir(exist_ok=True)
@@ -137,6 +137,26 @@ def build():
             for k, ti in enumerate(cue_tracks):
                 lines += [f"\tTRACK {k + 1:02d} AUDIO", f'\t\tFILE "{paths[ti]}" WAVE', f"\t\tINDEX 01 00:00:{k * 10:02d}"]
             (clip_dir / name).with_suffix(".cue").write_text("\n".join(lines), encoding="utf-8")
+    # a copy of the set where the first clip's head is far too short (3 s): must fail clearly
+    short_dir = OUT / "clips_short_head"
+    short_dir.mkdir(exist_ok=True)
+    for f in short_dir.glob("*"):
+        f.unlink()
+    for f in clip_dir.glob("*"):
+        (short_dir / f.name).write_bytes(f.read_bytes())
+    # T1 alone for 3 s, then T2 cut in at full level (no fade): the head is unusable
+    r1 = 124.0 / specs[0][1]
+    r2 = 124.0 / specs[1][1]
+    p1 = 100.0
+    dk = [DeckPlay(0, 0.0, 20.0, lambda t: np.full(np.shape(t), r1), lambda t: np.full(np.shape(t), 0.8)),
+          DeckPlay(1, 3.0, 40.0, lambda t: np.full(np.shape(t), r2), lambda t: np.full(np.shape(t), 0.8))]
+    src = [audio[0][:, int(p1 * SR):], audio[1]]
+    short_truth, _, _ = render_set(src, dk, use_wsola=True)
+    sf.write(short_dir / clips_spec[0][0], short_truth.T, SR, subtype="PCM_24")
+    (short_dir / clips_spec[0][0]).with_suffix(".cue").unlink(missing_ok=True)
+    for f in list(short_dir.glob("*")):
+        if f.name != clips_spec[0][0]:
+            f.unlink()
     m3u = OUT / "all_tracks.m3u8"
     m3u.write_text("#EXTM3U\n" + "".join(f"{p}\n" for p in paths), encoding="utf-8")
     return clip_dir, m3u, clips_spec, master, specs
@@ -184,6 +204,13 @@ def main():
     print(f"out-of-order clips rejected with a clear message: {good_error}")
     ok &= good_error
 
+    rc, log = run_tool([str(OUT / "clips_short_head"), "-t", str(m3u), "-o", str(OUT / "short.wav")], "log_short.txt")
+    good_error = rc != 0 and "too short" in log
+    print(f"too-short head rejected with a clear message: {good_error}")
+    if not good_error:
+        print(log[-600:])
+    ok &= good_error
+
     # 2) the real run
     out_p = OUT / "set_full.wav"
     t0 = time.time()
@@ -193,6 +220,13 @@ def main():
     if rc != 0:
         print("FAIL")
         return 1
+    # clean clips must not raise warnings (except the genuinely repetitive loop-heavy track T2)
+    warns = [ln.strip() for ln in log.splitlines() if ln.strip().startswith("!")]
+    unexpected = [w for w in warns if not ("repeats" in w and "'T2'" in w)]
+    print(f"warnings: {len(warns)} ({len(unexpected)} unexpected)")
+    for w in unexpected:
+        print(f"  unexpected: {w}")
+    ok &= not unexpected
     out, _ = sf.read(out_p, dtype="float32", always_2d=True)
     truth, _ = sf.read(OUT / "truth.wav", dtype="float32", always_2d=True)
     out, truth = out.T, truth.T

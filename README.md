@@ -32,8 +32,9 @@ Record each transition as its own file instead of one long recording with beat j
 
 1. Get the outgoing track playing alone, settled (tempo, EQ, FX where you'll leave them), and
    start recording.
-2. After **at least ~5 s (8+ is better)**, do the transition.
-3. Once the incoming track is playing alone and settled, keep recording **another 5-8+ s**, then stop.
+2. After **at least 8 s**, do the transition.
+3. Once the incoming track is playing alone and settled (outgoing track fully out), keep recording
+   **another 8+ s**, then stop.
 4. Load the next track, get to your next transition point (beat jump, cue, whatever) and repeat.
 
 rekordbox writes a `.cue` next to each recording, which tells the tool which tracks are in it.

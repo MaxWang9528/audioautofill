@@ -109,6 +109,8 @@ def main(argv: list[str]) -> int:
                     f"splice {e.splice:.2f}s into clip, match {e.score:.2f}")
                 for n in e.notes:
                     log(f"      ! {n}")
+                for n in e.debug:
+                    log.debug(n)
         notes = plan_bridges(clips, tracks)
         for n in notes:
             log(f"  note: {n}")
